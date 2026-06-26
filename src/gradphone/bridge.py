@@ -70,6 +70,7 @@ from fastapi.responses import PlainTextResponse
 from . import email_inbox
 from . import memory as memory_mod
 from . import db as db_mod
+from . import places
 from . import tenants
 from . import websearch
 from .business_agent import (
@@ -327,13 +328,49 @@ def _place_call_tool_def() -> Any:
     )
 
 
+def _find_business_tool_def() -> Any:
+    """Structured business lookup (Google Places) — returns a dialable phone.
+
+    web_search (Linkup) finds *which* business but rarely a usable number;
+    Places returns a verified internationalPhoneNumber, so this is what feeds
+    place_call for the find-and-call flow."""
+    return gradbot.ToolDef(
+        name="find_business",
+        description=(
+            "Look up a real business and its VERIFIED phone number to call. Use this "
+            "(NOT web_search) whenever the caller wants you to call a place — e.g. "
+            "'find a cafe near my hotel and call the best one'. Returns a ranked list "
+            "of candidates (name, rating, address, phone in E.164), best first. Pick the "
+            "top-rated one that has a phone and pass that phone straight to place_call. "
+            "Do NOT use web_search to find phone numbers — its numbers are unreliable."
+        ),
+        parameters_json=json.dumps({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "What to find, with the area/landmark — e.g. 'highly rated cafe "
+                        "near Hotel Carlton, Sutter Street, San Francisco'."
+                    ),
+                },
+            },
+            "required": ["query"],
+        }),
+    )
+
+
 def _assistant_tool_defs() -> list[Any]:
     """Tools for assistant mode (free personal call): email + memory + web +
-    place outbound call + hang up."""
+    business lookup + place outbound call + hang up."""
     if not HAS_GRADBOT:
         return []
-    return _memory_tool_defs() + [
+    tools = _memory_tool_defs() + [
         _web_search_tool_def(),
+    ]
+    if places.available():
+        tools.append(_find_business_tool_def())
+    tools += [
         _place_call_tool_def(),
         gradbot.ToolDef(
             name="get_email_summary",
@@ -353,6 +390,7 @@ def _assistant_tool_defs() -> list[Any]:
         ),
         _hang_up_tool_def(),
     ]
+    return tools
 
 
 def _receptionist_tool_defs() -> list[Any]:
@@ -499,9 +537,16 @@ class _CallState:
     # samples) and falls progressively out of sync with the caller track.
     caller_samples_written: int = 0
     agent_samples_written: int = 0
+    # web_search dedup: gemma sometimes fires the same query many times in a
+    # burst. We serialize + cache per-call so identical queries hit Linkup once
+    # and every duplicate gets the SAME result (no contradictory answers).
+    search_cache: dict = field(default_factory=dict)  # query_key -> (monotonic_ts, payload)
+    search_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 _EVENT_LOG_CAP = 40
+# How long a cached web_search result is reused for an identical query (s).
+_SEARCH_CACHE_TTL = 30.0
 
 
 def _log_event(state: _CallState, type_: str, **fields: object) -> None:
@@ -547,6 +592,7 @@ def _timeline_event(state: _CallState, name: str, **extra: object) -> None:
         "business_prompt_build": "system",
         "email_summary": "tool_call",
         "web_search": "tool_call",
+        "find_business": "tool_call",
         "place_call": "tool_call",
         "take_message": "tool_call",
         "remember": "tool_call",
@@ -955,32 +1001,77 @@ async def _handle_tool_call(handle, state: _CallState, send_event) -> None:
         # Receipt so the search is debuggable from Render logs: the query, then
         # its outcome (timeout / not_configured / failed / ok + latency).
         log.info("call %s | web_search query=%r", state.room_name, query)
+        key = query.lower()
+        # Serialize per-call so a burst of identical queries collapses to one
+        # Linkup call; every duplicate returns the SAME cached payload, so the
+        # model can't get two different results to answer twice with.
+        async with state.search_lock:
+            cached = state.search_cache.get(key)
+            if cached and (time.monotonic() - cached[0]) < _SEARCH_CACHE_TTL:
+                log.info("call %s | web_search CACHED query=%r", state.room_name, query)
+                await handle.send_json(cached[1])
+                return
+            t0 = time.time()
+            try:
+                # Hard cap the wait: a live call can't tolerate long silence. If
+                # Linkup is slow, fall back gracefully rather than hang the turn.
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(websearch.search, query), timeout=8.0
+                )
+            except asyncio.TimeoutError:
+                log.warning("call %s | web_search TIMEOUT after %.1fs query=%r", state.room_name, time.time() - t0, query)
+                _timeline_event(state, "web_search", query=query[:120], error="timeout")
+                await handle.send_json({"error": "The search took too long — tell the caller you couldn't pull it up right now.", "configured": True})
+                return
+            except websearch.WebSearchNotConfigured:
+                log.warning("call %s | web_search not configured (LINKUP_API_KEY missing)", state.room_name)
+                _timeline_event(state, "web_search", error="not_configured")
+                await handle.send_json({"error": "Web search isn't set up.", "configured": False})
+                return
+            except websearch.WebSearchError as exc:
+                log.warning("call %s | web_search FAILED query=%r: %s", state.room_name, query, exc)
+                _timeline_event(state, "web_search", query=query[:120], error="failed")
+                await handle.send_json({"error": "Couldn't reach the web right now.", "configured": True})
+                return
+            n_sources = len(result.get("sources", []))
+            log.info("call %s | web_search OK in %.1fs sources=%d query=%r", state.room_name, time.time() - t0, n_sources, query)
+            _timeline_event(state, "web_search", query=query[:120], sources=n_sources)
+            payload = {"answer": result["answer"], "sources": result["sources"]}
+            state.search_cache[key] = (time.monotonic(), payload)
+            await handle.send_json(payload)
+        return
+
+    if name == "find_business":
+        query = (args.get("query") or "").strip()
+        if not query:
+            await handle.send_error("Refused: empty query — say what business to find.")
+            return
+        log.info("call %s | find_business query=%r", state.room_name, query)
         t0 = time.time()
         try:
-            # Hard cap the wait: a live call can't tolerate long silence. If
-            # Linkup is slow, fall back gracefully rather than hang the turn.
-            result = await asyncio.wait_for(
-                asyncio.to_thread(websearch.search, query), timeout=8.0
+            results = await asyncio.wait_for(
+                asyncio.to_thread(places.find_businesses, query), timeout=8.0
             )
         except asyncio.TimeoutError:
-            log.warning("call %s | web_search TIMEOUT after %.1fs query=%r", state.room_name, time.time() - t0, query)
-            _timeline_event(state, "web_search", query=query[:120], error="timeout")
-            await handle.send_json({"error": "The search took too long — tell the caller you couldn't pull it up right now.", "configured": True})
+            log.warning("call %s | find_business TIMEOUT query=%r", state.room_name, query)
+            _timeline_event(state, "find_business", query=query[:120], error="timeout")
+            await handle.send_json({"error": "The lookup took too long — tell the caller you couldn't pull it up."})
             return
-        except websearch.WebSearchNotConfigured:
-            log.warning("call %s | web_search not configured (LINKUP_API_KEY missing)", state.room_name)
-            _timeline_event(state, "web_search", error="not_configured")
-            await handle.send_json({"error": "Web search isn't set up.", "configured": False})
+        except places.PlacesNotConfigured:
+            log.warning("call %s | find_business not configured (GOOGLE_PLACES_API_KEY missing)", state.room_name)
+            _timeline_event(state, "find_business", error="not_configured")
+            await handle.send_json({"error": "Business lookup isn't set up.", "configured": False})
             return
-        except websearch.WebSearchError as exc:
-            log.warning("call %s | web_search FAILED query=%r: %s", state.room_name, query, exc)
-            _timeline_event(state, "web_search", query=query[:120], error="failed")
-            await handle.send_json({"error": "Couldn't reach the web right now.", "configured": True})
+        except places.PlacesError as exc:
+            log.warning("call %s | find_business FAILED query=%r: %s", state.room_name, query, exc)
+            _timeline_event(state, "find_business", query=query[:120], error="failed")
+            await handle.send_json({"error": "Couldn't look that up right now."})
             return
-        n_sources = len(result.get("sources", []))
-        log.info("call %s | web_search OK in %.1fs sources=%d query=%r", state.room_name, time.time() - t0, n_sources, query)
-        _timeline_event(state, "web_search", query=query[:120], sources=n_sources)
-        await handle.send_json({"answer": result["answer"], "sources": result["sources"]})
+        n_with_phone = sum(1 for r in results if r.get("phone"))
+        log.info("call %s | find_business OK in %.1fs results=%d with_phone=%d query=%r",
+                 state.room_name, time.time() - t0, len(results), n_with_phone, query)
+        _timeline_event(state, "find_business", query=query[:120], results=len(results), with_phone=n_with_phone)
+        await handle.send_json({"results": results})
         return
 
     if name == "take_message":
@@ -1987,7 +2078,7 @@ async def twilio_stream(websocket: fastapi.WebSocket):
     # ("anything else?") comes later, outside the window, and is unaffected.
     post_tool = {"armed": False, "armed_at": 0.0, "answers": 0, "first_answer_at": 0.0}
     dup_drop = {"v": False}
-    dup_answer_window_s = _env_float("DUP_ANSWER_WINDOW_S", 3.0)
+    dup_answer_window_s = _env_float("DUP_ANSWER_WINDOW_S", 6.0)
     dup_arm_max_s = _env_float("DUP_ANSWER_ARM_MAX_S", 15.0)
 
     async def _maybe_play_filler() -> None:
@@ -2183,8 +2274,16 @@ async def twilio_stream(websocket: fastapi.WebSocket):
                     # so a second, conflicting answer to the same tool result is
                     # dropped (see post_tool note).
                     def _arm_post_tool(_t: asyncio.Task) -> None:
+                        nowm = time.monotonic()
+                        # Arm ONCE per burst: gemma fires the same tool many
+                        # times, and resetting the answer counter on each
+                        # completion would let every answer look like the
+                        # "first" and defeat the guard. Keep the existing count
+                        # if we're still armed within the window.
+                        if post_tool["armed"] and (nowm - post_tool["armed_at"]) <= dup_arm_max_s:
+                            return
                         post_tool["armed"] = True
-                        post_tool["armed_at"] = time.monotonic()
+                        post_tool["armed_at"] = nowm
                         post_tool["answers"] = 0
                         post_tool["first_answer_at"] = 0.0
                     task.add_done_callback(_arm_post_tool)
