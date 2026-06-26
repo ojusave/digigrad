@@ -69,6 +69,9 @@ projects:
                 sync: false
               - key: LLM_MODEL
                 sync: false
+              # Alternative to LLM_BASE_URL/LLM_MODEL: use OpenAI's API directly.
+              - key: OPENAI_API_KEY
+                sync: false
               - key: TWILIO_ACCOUNT_SID
                 sync: false
               - key: TWILIO_AUTH_TOKEN
@@ -81,6 +84,9 @@ projects:
                 sync: false
               # Optional features — leave unset to disable.
               - key: LINKUP_API_KEY
+                sync: false
+              # Business lookup for assistant-mode calls (find_business tool, places.py).
+              - key: GOOGLE_PLACES_API_KEY
                 sync: false
               - key: GMAIL_ADDRESS
                 sync: false
